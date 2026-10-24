@@ -464,6 +464,17 @@ parallel_nand_probe(struct SPI_NAND_FLASH_INFO_T *result)
 	       result->ptr_name, result->mfr_id, result->dev_id, result->ext_id,
 	       result->page_size, result->erase_size, result->soc_ecc_ability);
 
+#ifdef AIROHA_NAND_ECC_BRIDGE
+	/*
+	 * The migration table only overrides W29N02KVSIAF.  Say so out loud when
+	 * this preloader ends up on any other part: it then behaves exactly like
+	 * the released one and the board should be returned to the stock stack.
+	 */
+	if (strcmp((const char *)result->ptr_name, "W29N02KVSIAF") != 0)
+		NOTICE("Migration preloader: built for W29N02KVSIAF, %s keeps stock ECC\n",
+		       result->ptr_name);
+#endif
+
 	return SPI_NAND_FLASH_RTN_NO_ERROR;
 }
 

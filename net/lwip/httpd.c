@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+
 
+#include <airoha_nand.h>
 #include <asm/global_data.h>
 #include <command.h>
 #include <malloc.h>
@@ -172,6 +173,98 @@ static void service_network(void)
 
 static int parse_task(void);
 static int run_ubi_rebuild(void);
+
+/*
+ * Bridge builds drive Winbond flash at the vendor 8-bit codeword until the
+ * migration below rewrites it.  Every write that ends in UBI has to wait for
+ * that switch, otherwise the released 4-bit BL2 cannot read its own volume.
+ */
+#define HTTPD_BRIDGE_ECC_TARGET	4
+
+/* True only on the exact Winbond part the migration image was built for. */
+static bool bridge_active(void)
+{
+	return IS_ENABLED(CONFIG_AIROHA_NAND_ECC_BRIDGE) &&
+	       airoha_nand_bridge_active();
+}
+
+/* This image is a migration build, whatever flash it happens to run on. */
+static bool bridge_build(void)
+{
+	return IS_ENABLED(CONFIG_AIROHA_NAND_ECC_BRIDGE);
+}
+
+#if CONFIG_IS_ENABLED(AIROHA_NAND_ECC_BRIDGE)
+/*
+ * Rebuilding UBI erases the old FIP volume, so the board may only be rebooted
+ * once the official 4-bit BL2 and FIP have been written back.  Track both for
+ * the rest of the session; they are uploads, so nothing else can be inferred.
+ */
+static bool bridge_need_bl2;
+static bool bridge_need_fip;
+
+static int bridge_reboot_blocked(void)
+{
+	if (!bridge_active() || (!bridge_need_bl2 && !bridge_need_fip))
+		return 0;
+
+	puts("Migration build: the flash is not ready to boot yet.\n");
+	if (bridge_need_bl2)
+		puts("  - flash the OFFICIAL 4-bit preloader (Flash BL2)\n");
+	if (bridge_need_fip)
+		puts("  - flash the OFFICIAL bl31-u-boot.fip (Flash U-Boot)\n");
+	puts("Rebuilding UBI erased the FIP volume; rebooting now bricks the board.\n");
+	return -EPERM;
+}
+#else
+static int bridge_reboot_blocked(void)
+{
+	return 0;
+}
+#endif
+
+static bool bridge_ecc_pending(void)
+{
+	int strength;
+
+	if (!bridge_active())
+		return false;
+
+	strength = airoha_nand_get_ecc_strength();
+	return strength >= 0 && strength != HTTPD_BRIDGE_ECC_TARGET;
+}
+
+/*
+ * A board that was migrated once already carries a 4-bit UBI while this image
+ * starts at 8 bits.  Instead of leaving the user with a failing recovery UI,
+ * retry the attach on the released codeword once.
+ */
+static int bridge_ubi_part(char *part)
+{
+	int ret = ubi_part(part, NULL);
+
+	if (!ret || !bridge_active() || airoha_nand_get_ecc_strength() != 8)
+		return ret;
+
+	puts("Migration build: no UBI at ECC8/512, this board is probably\n");
+	puts("already on the released layout. Retrying at ECC4/512.\n");
+	ubi_detach();
+	if (airoha_nand_set_ecc_strength(HTTPD_BRIDGE_ECC_TARGET))
+		return ret;
+
+	return ubi_part(part, NULL);
+}
+
+static int bridge_require_migrated(void)
+{
+	if (!bridge_ecc_pending())
+		return 0;
+
+	puts("Bridge build: the flash still holds the vendor 8-bit ECC layout.\n");
+	puts("Select 'Rebuild UBI' first; that migrates the flash to 4-bit.\n");
+	return -EPERM;
+}
+
 static int run_nand_scrub(void);
 static int run_board_data_update(void);
 static int open_download(struct fs_file *file, const char *name);
@@ -287,6 +380,9 @@ static void build_info(void)
 		struct http_json j = { info_buf, sizeof(info_buf), 0, false };
 
 		json_printf(&j, "{\"model\":"); json_string(&j, board);
+		json_printf(&j, ",\"bridge\":%s,\"temp_build\":%s",
+			    bridge_active() ? "true" : "false",
+			    bridge_build() ? "true" : "false");
 		json_printf(&j, ",\"ram_bytes\":%llu,\"flash_bytes\":%llu",
 			    (unsigned long long)gd->ram_size, (unsigned long long)flash_size);
 		json_printf(&j, ",\"version\":"); json_string(&j, version_string);
@@ -1088,7 +1184,7 @@ static int run_storage_job(void)
 	if (request.kind == HTTP_STORAGE_UBI) {
 		if (!CONFIG_IS_ENABLED(CMD_UBI))
 			return CMD_RET_FAILURE;
-		ret = ubi_part(request.partition, NULL);
+		ret = bridge_ubi_part(request.partition);
 		if (ret)
 			return CMD_RET_FAILURE;
 
@@ -1270,6 +1366,10 @@ static int run_bootloader_update(bool bl2)
 	size_t length = buffer_size, capacity;
 	int ret = -EINVAL;
 
+	ret = bridge_require_migrated();
+	if (ret)
+		return ret;
+
 	if (!upload_region_valid(buffer_addr, length))
 		return -EINVAL;
 	uploaded = map_sysmem(buffer_addr, length);
@@ -1316,7 +1416,7 @@ static int run_bootloader_update(bool bl2)
 		ret = storage_mtd_transfer(mtd, 0, verify, length, true);
 	} else {
 		if (!CONFIG_IS_ENABLED(CMD_UBI)) { ret = -ENOSYS; goto out; }
-		ret = ubi_part((char *)part, NULL);
+		ret = bridge_ubi_part((char *)part);
 		if (ret) goto out;
 		ret = ubi_volume_get_size("fip", NULL, &capacity);
 		if (ret || length > capacity) { ret = ret ? ret : -EFBIG; goto out; }
@@ -1330,8 +1430,15 @@ static int run_bootloader_update(bool bl2)
 	}
 	if (!ret && memcmp(bl2 ? image : uploaded, verify, length))
 		ret = -EIO;
-	if (!ret)
+	if (!ret) {
 		printf("%s written and verified (%zu bytes).\n", bl2 ? "BL2" : "FIP", length);
+#if CONFIG_IS_ENABLED(AIROHA_NAND_ECC_BRIDGE)
+		if (bl2)
+			bridge_need_bl2 = false;
+		else
+			bridge_need_fip = false;
+#endif
+	}
 out:
 	if (ret)
 		printf("%s update failed (%d).\n", bl2 ? "BL2" : "FIP", ret);
@@ -1464,6 +1571,9 @@ static int run_firmware_update(void)
 	if (!CONFIG_IS_ENABLED(CMD_UBI))
 		return CMD_RET_FAILURE;
 
+	if (bridge_require_migrated())
+		return CMD_RET_FAILURE;
+
 	if (!upload_region_valid(load_addr, file_size)) {
 		puts("Firmware upload buffer is invalid.\n");
 		return CMD_RET_FAILURE;
@@ -1478,7 +1588,7 @@ static int run_firmware_update(void)
 	expected_crc = crc32_wd(0, image, file_size, CHUNKSZ_CRC32);
 	unmap_sysmem(image);
 
-	ret = ubi_part((char *)ubi_partition, NULL);
+	ret = bridge_ubi_part((char *)ubi_partition);
 	if (ret) {
 		printf("Unable to attach UBI partition '%s'.\n", ubi_partition);
 		return CMD_RET_FAILURE;
@@ -1576,6 +1686,12 @@ static int run_ubi_rebuild(void)
 	ret = ubi_detach();
 	if (ret)
 		return ret;
+	if (bridge_ecc_pending()) {
+		puts("Bridge: moving the flash to the released 4-bit ECC layout.\n");
+		ret = airoha_nand_set_ecc_strength(HTTPD_BRIDGE_ECC_TARGET);
+		if (ret)
+			return ret;
+	}
 	mtd = get_mtd_device_nm(part);
 	if (IS_ERR(mtd))
 		return PTR_ERR(mtd);
@@ -1597,8 +1713,24 @@ static int run_ubi_rebuild(void)
 out:
 	if (ret)
 		printf("UBI rebuild failed during %s (%d).\n", phase, ret);
-	else
+	else {
 		puts("UBI rebuilt with empty base volumes. Write FIP, board data and system firmware before reboot.\n");
+		if (bridge_active()) {
+			puts("\n*** MIGRATION BUILD - READ THIS ***\n");
+			puts("The flash now uses the released 4-bit layout and the FIP\n");
+			puts("volume is empty.  In this order:\n");
+			puts("  1. Flash BL2  - the OFFICIAL preloader / firstblock\n");
+			puts("  2. Flash U-Boot - the OFFICIAL bl31-u-boot.fip\n");
+			puts("  3. Restore board data, write the system image, then reboot\n");
+			puts("Do NOT flash this migration build again: it writes the vendor\n");
+			puts("8-bit layout, so the next boot bricks and needs TTL recovery.\n");
+			puts("*** MIGRATION BUILD - READ THIS ***\n\n");
+#if CONFIG_IS_ENABLED(AIROHA_NAND_ECC_BRIDGE)
+			bridge_need_bl2 = true;
+			bridge_need_fip = true;
+#endif
+		}
+	}
 	return ret;
 }
 
@@ -1645,8 +1777,12 @@ static int run_board_data_update(void)
 {
 	int ret;
 
+	ret = bridge_require_migrated();
+	if (ret)
+		return ret;
+
 	if (storage_request.kind == HTTP_STORAGE_UBI) {
-		ret = ubi_part(storage_request.partition, NULL);
+		ret = bridge_ubi_part(storage_request.partition);
 		if (ret)
 			return ret;
 		if (!ubi_volume_exists(storage_request.target)) {
@@ -1728,16 +1864,22 @@ static int run_action(void)
 {
 	ulong load_addr;
 
-	if (!strcmp(action_buf, "boot-production"))
+	if (!strcmp(action_buf, "boot-production")) {
+		if (bridge_reboot_blocked())
+			return CMD_RET_FAILURE;
 		return run_command("run boot_production", 0);
+	}
 
 	if (!strcmp(action_buf, "boot-upload")) {
 		load_addr = env_get_ulong("loadaddr", 16, CONFIG_SYS_LOAD_ADDR);
 		return run_commandf("bootm 0x%lx", load_addr);
 	}
 
-	if (!strcmp(action_buf, "reset"))
+	if (!strcmp(action_buf, "reset")) {
+		if (bridge_reboot_blocked())
+			return CMD_RET_FAILURE;
 		return run_command("reset", 0);
+	}
 
 	if (!strcmp(action_buf, "exit")) {
 		stop_requested = true;

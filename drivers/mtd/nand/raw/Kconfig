@@ -661,6 +661,17 @@ config NAND_AIROHA_EN7581
 	  The controller keeps eight FDM bytes in each 512-byte sector and uses
 	  UBI for bad-block and wear management.
 
+config AIROHA_NAND_ECC_BRIDGE
+	bool "Bridge build: read legacy 8-bit Winbond flash and migrate to 4-bit"
+	depends on NAND_AIROHA_EN7581
+	help
+	  Builds a one-shot recovery U-Boot for Winbond flash that the vendor
+	  kernel programmed with 8-bit BCH ECC, while the released stack uses
+	  4-bit. The bridge build drives the controller at 8 bits/512B so the
+	  vendor UBI stays readable, and switches the flash to 4 bits/512B when
+	  the recovery UI rebuilds UBI, leaving the board compatible with the
+	  released 4-bit BL2 and U-Boot.
+
 comment "Generic NAND options"
 
 config SYS_NAND_BLOCK_SIZE

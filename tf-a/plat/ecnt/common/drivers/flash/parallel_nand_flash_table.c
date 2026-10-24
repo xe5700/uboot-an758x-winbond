@@ -6,6 +6,17 @@
 
 #include <ecnt_spi_nand_flash.h>
 
+/*
+ * The released stack drives this Winbond part at 4 bits/512B, but the vendor
+ * kernel programs it at 8 bits/512B.  Bridge builds ship a temporary BL2 that
+ * keeps the vendor codeword so the legacy UBI stays readable.
+ */
+#ifdef AIROHA_NAND_ECC_BRIDGE
+#define PNAND_WINBOND_W29N02KV_ECC	8
+#else
+#define PNAND_WINBOND_W29N02KV_ECC	4
+#endif
+
 #define PNAND_ID(_mfr, _dev, _name, _size, _page, _erase, _oob, _feature, \
 		  _ext, _timing, _required_ecc, _cycles, _controller_ecc) { \
 	.mfr_id = (_mfr), \
@@ -57,7 +68,8 @@ static const struct SPI_NAND_FLASH_INFO_T parallel_nand_flash_table[] = {
 	PNAND_ID(_SPI_NAND_MANUFACTURER_ID_WINBOND, 0xda, "W29N02KVSIAF",
 		  _SPI_NAND_CHIP_SIZE_2GBIT, _SPI_NAND_PAGE_SIZE_2KBYTE,
 		  _SPI_NAND_BLOCK_SIZE_128KBYTE, _SPI_NAND_OOB_SIZE_128BYTE,
-		  SPI_NAND_FLASH_FEATURE_NONE, 0x069510, PARALLEL_NAND_FLASH_TIMING, 4, 5, 4),
+		  SPI_NAND_FLASH_FEATURE_NONE, 0x069510, PARALLEL_NAND_FLASH_TIMING,
+		  4, 5, PNAND_WINBOND_W29N02KV_ECC),
 	PNAND_ID(_SPI_NAND_MANUFACTURER_ID_WINBOND, 0xda, "W29N02KVSIAE",
 		  _SPI_NAND_CHIP_SIZE_2GBIT, _SPI_NAND_PAGE_SIZE_2KBYTE,
 		  _SPI_NAND_BLOCK_SIZE_128KBYTE, _SPI_NAND_OOB_SIZE_128BYTE,

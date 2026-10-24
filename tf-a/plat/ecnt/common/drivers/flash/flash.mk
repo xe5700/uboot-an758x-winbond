@@ -28,6 +28,15 @@ ifneq ($(TCSUPPORT_PARALLEL_NAND),)
 # vendor NFI register unions use this definition to place command, address,
 # page-format, DMA, and ECC fields at their hardware bit positions.
 BL2_CFLAGS	+= -DTCSUPPORT_PARALLEL_NAND -DTCSUPPORT_LITTLE_ENDIAN
+ifneq ($(TCSUPPORT_NAND_BRIDGE_ECC),)
+# Temporary recovery BL2 that keeps the vendor 8-bit Winbond codeword.
+BL2_CFLAGS	+= -DAIROHA_NAND_ECC_BRIDGE
+endif
+ifneq ($(TCSUPPORT_NAND_BRIDGE_NO_AUTH),)
+# The recovery stack is thrown away after migration, so let it run without
+# the release signing key.  The official 4-bit chain keeps its own auth.
+BL2_CFLAGS	+= -DAIROHA_BRIDGE_NO_AUTH
+endif
 FLASH_SRCS	+=	$(addprefix plat/ecnt/common/drivers/flash/,	\
 				parallel_nand_flash.c			\
 				parallel_nand_flash_table.c)

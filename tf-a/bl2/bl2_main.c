@@ -108,6 +108,11 @@ void bl2_main(void)
 {
 	entry_point_info_t *next_bl_ep_info;
 
+#if defined(AIROHA_BRIDGE_NO_AUTH) && TRUSTED_BOARD_BOOT && defined(DYN_DISABLE_AUTH)
+	NOTICE("BL2: migration build, image authentication disabled\n");
+	dyn_disable_auth();
+#endif
+
 #if ENABLE_RUNTIME_INSTRUMENTATION
 	PMF_CAPTURE_TIMESTAMP(bl_svc, BL2_ENTRY, PMF_CACHE_MAINT);
 #endif

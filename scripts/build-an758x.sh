@@ -16,6 +16,10 @@ Optional environment:
   BUILD_ROOT            Build workspace (default: <repo>/build)
   OUTPUT_ROOT           Firmware output directory (default: <repo>/output)
   BUILD_JOBS            Parallel jobs (default: detected CPU count)
+  BRIDGE_ECC=1          Build the temporary Winbond recovery stack that reads
+                        the vendor 8-bit layout and migrates to 4-bit
+  BRIDGE_TBB=0          Also build that recovery stack without image
+                        authentication, so no signing key is required
   AIROHA_SIGN_KEY_PATH   RSA-4096 PEM private-key file (first choice)
   AIROHA_SIGN_KEY        RSA-4096 PEM private-key contents
 EOF
@@ -119,9 +123,17 @@ xg-040g-mf)
 	;;
 esac
 
-uboot_build="$build_root/$board/u-boot"
-tfa_build="$build_root/$board/tf-a"
-board_output="$output_root/$board"
+bridge_ecc="${BRIDGE_ECC:-0}"
+artifact_tag=""
+build_variant="$board"
+if [ "$bridge_ecc" -eq 1 ]; then
+	artifact_tag="-tmp-8bit-read-4bit-write"
+	build_variant="$board$artifact_tag"
+fi
+
+uboot_build="$build_root/$build_variant/u-boot"
+tfa_build="$build_root/$build_variant/tf-a"
+board_output="$output_root/$build_variant"
 host_tools="$build_root/host-tools"
 lzma_source="$repo_dir/tools/lzma-sdk-4.65"
 lzma_build="$host_tools/lzma-sdk-4.65"
@@ -149,6 +161,12 @@ chmod +x "$lzma_tool"
 # the upstream-derived source tree.
 make -C "$repo_dir" O="$uboot_build" CROSS_COMPILE="$CROSS_COMPILE" \
 	"$defconfig"
+if [ "$bridge_ecc" -eq 1 ]; then
+	"$repo_dir/scripts/config" --file "$uboot_build/.config" \
+		--enable AIROHA_NAND_ECC_BRIDGE
+	make -C "$repo_dir" O="$uboot_build" CROSS_COMPILE="$CROSS_COMPILE" \
+		olddefconfig
+fi
 make -C "$repo_dir" O="$uboot_build" CROSS_COMPILE="$CROSS_COMPILE" \
 	-j"$jobs"
 "$lzma_tool" e "$uboot_build/u-boot.bin" "$board_output/u-boot.lzma"
@@ -171,6 +189,15 @@ common_atf_args="PLAT=en7523 CONFIG_ECNT=1 TCSUPPORT_OPENWRT=1 TCSUPPORT_ATF_UNO
 
 if [ "$parallel_nand" -eq 1 ]; then
 	common_atf_args="$common_atf_args TCSUPPORT_PARALLEL_NAND=1"
+fi
+if [ "$bridge_ecc" -eq 1 ]; then
+	common_atf_args="$common_atf_args TCSUPPORT_NAND_BRIDGE_ECC=1"
+	# The recovery stack only has to run once: skip image authentication so a
+	# build without the release key still boots.  The official 4-bit stack is
+	# flashed afterwards and keeps its own signed chain.
+	if [ "${BRIDGE_TBB:-1}" -eq 0 ]; then
+		common_atf_args="$common_atf_args TCSUPPORT_NAND_BRIDGE_NO_AUTH=1 DYN_DISABLE_AUTH=1"
+	fi
 fi
 if [ "$emmc" -eq 1 ]; then
 	common_atf_args="$common_atf_args TCSUPPORT_EMMC=1"
@@ -230,23 +257,23 @@ mkdir -p "$packaged"
 
 "$fiptool" create --align 1024 \
 	--tb-fw "$board_output/bl2.bin" \
-	"$packaged/$artifact_prefix-preloader.bin"
+	"$packaged/$artifact_prefix-preloader$artifact_tag.bin"
 
 "$fiptool" create --align 1024 \
 	--soc-fw "$board_output/bl31.lzma" \
 	--nt-fw "$board_output/u-boot.lzma" \
-	"$packaged/$artifact_prefix-bl31-u-boot.fip"
+	"$packaged/$artifact_prefix-bl31-u-boot$artifact_tag.fip"
 
 sh "$repo_dir/scripts/sign-an758x-fip.sh" "$tfa_build" \
-	"$packaged/$artifact_prefix-preloader.bin" \
-	"$packaged/$artifact_prefix-bl31-u-boot.fip"
+	"$packaged/$artifact_prefix-preloader$artifact_tag.bin" \
+	"$packaged/$artifact_prefix-bl31-u-boot$artifact_tag.fip"
 
 # Packing after signing keeps the first eraseblock and standalone preloader
 # identical at the FIP offset consumed by the boot ROM.
 if [ "$parallel_nand" -eq 1 ]; then
 	sh "$repo_dir/scripts/airoha_pack_firstblock.sh" \
-		"$packaged/$artifact_prefix-preloader.bin" \
-		"$packaged/$artifact_prefix-firstblock.bin"
+		"$packaged/$artifact_prefix-preloader$artifact_tag.bin" \
+		"$packaged/$artifact_prefix-firstblock$artifact_tag.bin"
 fi
 
 cp "$packaged/"* "$board_output/"

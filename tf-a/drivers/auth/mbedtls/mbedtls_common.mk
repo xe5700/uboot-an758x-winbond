@@ -73,8 +73,14 @@ else ifeq (${MBEDTLS_MAJOR}, 3)
 						constant_time.c		\
 						bignum_core.c		\
 						rsa_alt_helpers.c	\
+						)
+# hash_info.c only exists in newer Mbed TLS 3 trees; trimmed vendor
+# copies omit it and nothing in TF-A references its PSA glue.
+ifneq ($(wildcard ${MBEDTLS_DIR}/library/hash_info.c),)
+	LIBMBEDTLS_SRCS +=  $(addprefix ${MBEDTLS_DIR}/library/,	\
 						hash_info.c		\
 						)
+endif
 
 	# Currently on Mbedtls-3 there is outstanding bug due to usage
 	# of redundant declaration[1], So disable redundant-decls

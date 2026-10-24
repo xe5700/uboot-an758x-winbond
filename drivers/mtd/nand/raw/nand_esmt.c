@@ -8,8 +8,8 @@
  * legacy, matches Linux mainline behavior). The framework's
  * nand_manuf_ids[] table maps 0xc8 to this ops structure. The detect
  * hook discriminates GigaDevice SLC by examining id.data[4/5] and,
- * when matched, switches chip->manufacturer.desc to point at
- * gigadevice_nand_manuf_ops so the user sees the correct vendor name
+ * when matched, switches chip->manufacturer.desc to the GigaDevice
+ * descriptor so the user sees the correct vendor name
  * and any GigaDevice-specific quirks apply.
  *
  * Detection pattern is heuristic: GigaDevice SLC series such as GD5F1GQ4
@@ -19,6 +19,12 @@
  */
 
 #include <linux/mtd/rawnand.h>
+
+static struct nand_manufacturer gigadevice_nand_manuf_desc = {
+	.id = NAND_MFR_GIGADEVICE,
+	.name = "GigaDevice",
+	.ops = &gigadevice_nand_manuf_ops,
+};
 
 static void esmt_nand_decode_id(struct nand_chip *chip)
 {
@@ -31,7 +37,7 @@ static void esmt_nand_decode_id(struct nand_chip *chip)
 	 */
 	if (chip->id.len >= 5 &&
 	    (chip->id.data[4] & 0xf0) == 0xc0)
-		chip->manufacturer.desc = &gigadevice_nand_manuf_ops;
+		chip->manufacturer.desc = &gigadevice_nand_manuf_desc;
 }
 
 static int esmt_nand_init(struct nand_chip *chip)

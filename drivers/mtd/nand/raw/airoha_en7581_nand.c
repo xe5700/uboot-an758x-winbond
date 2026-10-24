@@ -8,10 +8,12 @@
  */
 
 #include <clk.h>
+#include <command.h>
 #include <dm.h>
 #include <dm/device_compat.h>
 #include <log.h>
 #include <nand.h>
+#include <vsprintf.h>
 #include <malloc.h>
 #include <memalign.h>
 #include <linux/dma-direction.h>
@@ -21,6 +23,9 @@
 #include <linux/sizes.h>
 #include <linux/bitops.h>
 #include <linux/bitfield.h>
+#if CONFIG_IS_ENABLED(CMD_UBI)
+#include <ubi_uboot.h>
+#endif
 #include "airoha_en7581_nand.h"
 
 /* NFI core registers */
@@ -231,6 +236,38 @@ static u8 airoha_dma_buffer[SZ_8K] __aligned(ARCH_DMA_MINALIGN);
 static const u16 airoha_nfi_page_size[] = { SZ_512, SZ_2K, SZ_4K };
 static const u8 airoha_nfi_spare_size[] = { 16, 26, 27, 28 };
 static const u8 airoha_ecc_strength[] = { 4, 6, 8, 10, 12, 14, 16 };
+
+/*
+ * On-flash BCH strength, 0 keeps the value advertised by the chip table.
+ * A bridge build starts at 8 bits/512B to match the vendor kernel and moves
+ * to 4 bits/512B once the recovery UI rebuilds UBI for the released stack.
+ */
+static int ecc_strength_override;
+
+/*
+ * Set only when this build really is the Winbond migration build and the
+ * attached chip is the one it was made for.  Everything user-visible on the
+ * recovery side hangs off this flag, so a migration image that ends up on any
+ * other board behaves exactly like a stock build.
+ */
+static bool bridge_active;
+
+/* W29N02KVSIAF: ef da 10 95 06.  SIAE ends in 07, W29N02GV starts at 90. */
+static const u8 winbond_w29n02kv_id[5] = { 0xef, 0xda, 0x10, 0x95, 0x06 };
+
+static bool nand_id_is_winbond_w29n02kv(const struct nand_chip *nand)
+{
+	int i;
+
+	if (nand->id.len < ARRAY_SIZE(winbond_w29n02kv_id))
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(winbond_w29n02kv_id); i++)
+		if (nand->id.data[i] != winbond_w29n02kv_id[i])
+			return false;
+
+	return true;
+}
 
 static inline u32 nfi_read32(struct airoha_nfc *nfc, u32 reg)
 {
@@ -792,9 +829,15 @@ static int airoha_nfc_calc_ecc_strength(struct airoha_nfc *nfc,
 	u32 required, strength;
 	int i;
 
-	/* The declared strength selects the on-flash BCH codeword. */
-	required = nand->ecc_step_ds == ECC_SECTOR_SIZE ?
-		   nand->ecc_strength_ds : 0;
+	/*
+	 * The on-flash BCH codeword follows the override when a bridge build is
+	 * migrating, otherwise the strength declared by the chip table.
+	 */
+	if (ecc_strength_override)
+		required = ecc_strength_override;
+	else
+		required = nand->ecc_step_ds == ECC_SECTOR_SIZE ?
+			   nand->ecc_strength_ds : 0;
 	strength = avail_ecc_bytes * 8 / ECC_PARITY_BITS;
 
 	if (required) {
@@ -928,6 +971,20 @@ static int airoha_nfc_attach_chip(struct nand_chip *nand)
 	if (nand->options & NAND_BUSWIDTH_16) {
 		pr_err("16-bit buswidth is not supported");
 		return -EINVAL;
+	}
+
+	/*
+	 * The vendor kernel writes this flash with 8-bit BCH, while the released
+	 * stack reads 4-bit.  Start the bridge build on the vendor layout so the
+	 * legacy UBI is readable, and leave the switch to the recovery UI.
+	 */
+	if (IS_ENABLED(CONFIG_AIROHA_NAND_ECC_BRIDGE) &&
+	    nand_id_is_winbond_w29n02kv(nand)) {
+		ecc_strength_override = 8;
+		bridge_active = true;
+		printf("EN7581 parallel NAND: MIGRATION build (8-bit read / 4-bit write)\n");
+		printf("  Winbond flash at ECC8/512; run 'nandecc 4' or rebuild UBI to migrate\n");
+		printf("  then flash the OFFICIAL 4-bit U-Boot, not this file\n");
 	}
 
 	ret = airoha_nfc_ecc_init(nfc);
@@ -1569,6 +1626,104 @@ U_BOOT_DRIVER(airoha_en7581_nand) = {
 	.probe = airoha_nfc_probe,
 	.priv_auto = sizeof(struct airoha_nfc),
 };
+
+/**
+ * airoha_nand_get_ecc_strength() - report the on-flash BCH strength
+ *
+ * Return: bits corrected per 512-byte sector, or a negative error code when
+ * the parallel NAND controller is not probed.
+ */
+/**
+ * airoha_nand_bridge_active() - report whether the migration path applies
+ *
+ * True only for a build with CONFIG_AIROHA_NAND_ECC_BRIDGE that found the exact
+ * Winbond part it was built for.  Callers must treat any other board as stock.
+ */
+bool airoha_nand_bridge_active(void)
+{
+	return bridge_active;
+}
+
+int airoha_nand_get_ecc_strength(void)
+{
+	struct mtd_info *mtd = get_nand_dev_by_index(0);
+
+	if (!mtd)
+		return -ENODEV;
+
+	return mtd_to_nand(mtd)->ecc.strength;
+}
+
+/**
+ * airoha_nand_set_ecc_strength() - reprogram the controller for a new codeword
+ * @strength: bits corrected per 512-byte sector
+ *
+ * Changing the strength rewrites the BCH configuration and the page format, so
+ * every later read and write uses the new codeword.  UBI must be detached
+ * beforehand; the command wrapper does that.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int airoha_nand_set_ecc_strength(int strength)
+{
+	struct mtd_info *mtd = get_nand_dev_by_index(0);
+	struct nand_chip *nand;
+	struct airoha_nfc *nfc;
+	int ret;
+
+	if (!mtd)
+		return -ENODEV;
+
+	nand = mtd_to_nand(mtd);
+	nfc = nand_get_controller_data(nand);
+	if (!nfc)
+		return -ENODEV;
+
+	ecc_strength_override = strength;
+
+	ret = airoha_nfc_ecc_init(nfc);
+	if (ret)
+		return ret;
+
+	ret = airoha_nfc_set_page_format(nfc);
+	if (ret)
+		return ret;
+
+	printf("EN7581 parallel NAND: on-flash ECC%u/512, %u spare bytes/sector\n",
+	       nand->ecc.strength, nfc->spare_per_sector);
+
+	return 0;
+}
+
+static int do_nandecc(struct cmd_tbl *cmdtp, int flag, int argc,
+		      char *const argv[])
+{
+	int strength;
+
+	if (argc < 2) {
+		strength = airoha_nand_get_ecc_strength();
+		if (strength < 0)
+			return CMD_RET_FAILURE;
+		printf("on-flash ECC: %d bits/512B\n", strength);
+		return CMD_RET_SUCCESS;
+	}
+
+	strength = dectoul(argv[1], NULL);
+
+	if (CONFIG_IS_ENABLED(CMD_UBI) && ubi_devices[0]) {
+		if (ubi_detach())
+			return CMD_RET_FAILURE;
+	}
+
+	return airoha_nand_set_ecc_strength(strength) ?
+		CMD_RET_FAILURE : CMD_RET_SUCCESS;
+}
+
+U_BOOT_CMD(nandecc, 2, 0, do_nandecc,
+	   "show or change the parallel NAND on-flash ECC",
+	   "[bits/512B]\n"
+	   "    - with no argument, print the current strength\n"
+	   "    - 'nandecc 4' returns the controller to the released 4-bit layout");
 
 void airoha_nfc_spl_init(struct airoha_nfc *nfc)
 {

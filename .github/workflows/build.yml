@@ -1,4 +1,12 @@
-name: Build AN758x U-Boot
+name: Build AN758x U-Boot (Winbond migration)
+
+# Temporary migration stack for Winbond W29N02KVSIAF boards:
+# BL2 and U-Boot read the vendor 8-bit layout and rewrite UBI at 4-bit, then
+# the board is returned to the official 4-bit preloader and FIP.
+#
+# Image authentication is disabled in this build (BRIDGE_TBB=0) on purpose, so
+# no signing key is required.  The official 4-bit stack flashed afterwards
+# keeps its own signed chain.
 
 on:
   push:
@@ -18,15 +26,6 @@ jobs:
           - hg5382a
           - hg5585f-ct
           - hg5585f-cu
-          - xg2010g
-          - xr1710g
-          - zn504xg-d
-          - zn515xg-d
-          - ung00a
-          - xg-040g-md
-          - xg-040g-tf
-          - xg-040g-mf
-          - hm2004-du
 
     steps:
       - uses: actions/checkout@v4
@@ -45,19 +44,20 @@ jobs:
             tar -xz
           echo "MBEDTLS_DIR=$PWD/mbedtls-3.4.1" >> "$GITHUB_ENV"
 
-      - name: Build ${{ matrix.target }}
+      - name: Build ${{ matrix.target }} (migration)
         env:
           CROSS_COMPILE: aarch64-linux-gnu-
           ARM32_CROSS_COMPILE: arm-none-eabi-
           BUILD_JOBS: 4
-          AIROHA_SIGN_KEY: ${{ secrets.AIROHA_SIGN_KEY }}
+          BRIDGE_ECC: "1"
+          BRIDGE_TBB: "0"
         run: ./scripts/build-an758x.sh "${{ matrix.target }}"
 
       - name: Upload ${{ matrix.target }}
         uses: actions/upload-artifact@v4
         with:
-          name: an758x-${{ matrix.target }}
-          path: output/${{ matrix.target }}/an75*
+          name: an758x-${{ matrix.target }}-tmp-8bit-read-4bit-write
+          path: output/${{ matrix.target }}-tmp-8bit-read-4bit-write/an75*
           if-no-files-found: error
 
   release:
